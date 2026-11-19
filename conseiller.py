@@ -18,6 +18,34 @@ client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.co
 
 NOMS_REGION = {0: "Nord-Est", 1: "Nord-Ouest", 2: "Sud-Est", 3: "Sud-Ouest"}
 
+# Les SEULS conseils de santé que l'agent peut donner : des recommandations officielles de l'OMS.
+# Le code choisit celles qui concernent l'assuré ; l'agent les explique, il n'en invente pas d'autres.
+RECOMMANDATIONS = {
+    "tabac": "Arrêter de fumer : le tabac est l'un des principaux facteurs de risque évitables de maladies (OMS). "
+             "Un médecin, un pharmacien ou un service d'aide à l'arrêt peut accompagner l'arrêt (substituts nicotiniques, suivi).",
+    "poids": "Viser un IMC normal, entre 18,5 et 25 (classification de l'OMS) ; au-dessus de 25, c'est un surpoids, "
+             "au-dessus de 30, une obésité. La perte de poids se fait progressivement, avec l'avis d'un médecin.",
+    "maigreur": "Un IMC sous 18,5 correspond à une insuffisance pondérale (OMS) : en parler à un médecin.",
+    "activite": "Pratiquer au moins 150 à 300 minutes d'activité physique d'intensité modérée par semaine, "
+                "par exemple de la marche rapide ou du vélo (recommandation de l'OMS pour les adultes).",
+    "alimentation": "Manger au moins 400 g de fruits et légumes par jour (environ 5 portions), limiter les sucres libres "
+                    "à moins de 10 % des apports énergétiques et le sel à moins de 5 g par jour (OMS).",
+    "suivi": "Consulter régulièrement un médecin pour un suivi de sa santé (tension, poids, analyses selon son âge).",
+}
+
+
+def recommandations_pour(profil):
+    """Le code choisit les recommandations qui concernent l'assuré."""
+    cles = []
+    if profil["fumeur"] == 1:
+        cles.append("tabac")
+    if profil["imc"] >= 25:
+        cles.append("poids")
+    elif profil["imc"] < 18.5:
+        cles.append("maigreur")
+    cles += ["activite", "alimentation", "suivi"]
+    return [RECOMMANDATIONS[c] for c in cles]
+
 
 def decrire_profil(profil):
     """Le profil de l'assuré en mots simples."""
@@ -34,7 +62,8 @@ def simuler(modele, colonnes, profil):
     def predire(p):
         return round(float(modele.predict(pd.DataFrame([[p[c] for c in colonnes]], columns=colonnes))[0]))
 
-    scenarios = [{"situation": "situation actuelle", "charge": predire(profil)}]
+    actuelle = predire(profil)
+    scenarios = [{"situation": "situation actuelle", "charge": actuelle}]
     if profil["fumeur"] == 1:
         scenarios.append({"situation": "s'il arrête de fumer", "charge": predire({**profil, "fumeur": 0})})
     if profil["imc"] > IMC_CIBLE:
@@ -42,25 +71,35 @@ def simuler(modele, colonnes, profil):
     if profil["fumeur"] == 1 and profil["imc"] > IMC_CIBLE:
         scenarios.append({"situation": f"s'il arrête de fumer et que son IMC descend à {IMC_CIBLE}",
                           "charge": predire({**profil, "fumeur": 0, "imc": IMC_CIBLE})})
-    return scenarios
+    # Seules les simulations qui font vraiment baisser la charge sont gardées :
+    # une estimation plus haute (une particularité du modèle) induirait l'assuré en erreur.
+    return [scenarios[0]] + [s for s in scenarios[1:] if s["charge"] < actuelle]
 
 
 def consigne(profil, scenarios):
-    """La consigne de l'agent, avec le profil et les résultats de l'outil."""
+    """La consigne de l'agent : le profil, les montants du modèle et les recommandations officielles."""
     lignes = "\n".join(f"- {s['situation']} : {s['charge']} $ par an" for s in scenarios)
+    if len(scenarios) == 1:
+        lignes += "\n(Le modèle ne montre pas d'économie possible en changeant le tabac ou l'IMC.)"
+    conseils = "\n".join(f"- {r}" for r in recommandations_pour(profil))
     return f"""Tu es le conseiller de l'application de prédiction des charges d'assurance santé. Tu aides l'assuré à payer moins cher et à prendre soin de sa santé, avec bienveillance, comme un bon agent d'assurance.
 
 Profil de l'assuré : {decrire_profil(profil)}.
-Charges estimées par le modèle (calculées par l'application, chiffres exacts) :
+
+1. Les montants, estimés par le modèle de l'application (chiffres exacts) :
 {lignes}
 
+2. Les recommandations de santé officielles qui concernent cet assuré (OMS) :
+{conseils}
+
 Ta mission :
-- Explique simplement ce qui fait monter sa charge et ce qu'il peut changer lui-même, en t'appuyant sur les chiffres ci-dessus.
-- Donne des conseils de prévention concrets et réalistes (arrêt du tabac, activité physique, alimentation, sommeil, bilans de santé réguliers), adaptés à son profil.
+- Explique ce que montrent les montants, puis donne les recommandations de santé ci-dessus, simplement et concrètement.
+- Tes conseils de santé viennent UNIQUEMENT de la liste 2 : n'en invente aucun autre, ne change pas leurs chiffres.
+- Un conseil de santé ne dépend jamais d'un montant : ne conseille jamais de garder un IMC au-dessus de 25 ni de prendre du poids pour payer moins.
 - Ne conseille jamais de changer ce qui ne dépend pas de lui (âge, sexe, région, nombre d'enfants).
 
 Tes limites :
-- Utilise seulement les montants de la liste ci-dessus ; n'invente aucun autre montant.
+- Utilise seulement les montants de la liste 1 ; n'invente aucun autre montant.
 - Dis que ce sont des estimations du modèle, pas un prix garanti par un assureur.
 - Tu ne fais pas de diagnostic médical : pour une question sur sa santé personnelle, oriente vers un médecin.
 - Si la question n'a rien à voir avec l'assurance santé ou la prévention, réponds gentiment que tu es là pour ces sujets.
@@ -85,7 +124,7 @@ def _appeler(messages):
     """Appelle le modèle principal, ou le modèle de secours si Groq le refuse."""
     for modele in (MODELE, MODELE_SECOURS):
         try:
-            reponse = client.chat.completions.create(model=modele, messages=messages, max_tokens=900, temperature=0.4)
+            reponse = client.chat.completions.create(model=modele, messages=messages, max_tokens=1600, temperature=0.4)
             texte = reponse.choices[0].message.content or ""
             return re.sub(r"<think>.*?</think>", "", texte, flags=re.DOTALL).strip()
         except Exception as e:
